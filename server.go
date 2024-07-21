@@ -98,7 +98,9 @@ func (srv *Server) Serve(l net.Listener) error {
 	var tempDelay time.Duration // how long to sleep on accept failure
 	ctx := context.WithValue(baseCtx, http.ServerContextKey, srv)
 	for {
-		srv.connSem <- struct{}{}
+		if srv.connSem != nil {
+			srv.connSem <- struct{}{}
+		}
 		rw, err := l.Accept()
 		if err != nil {
 			if srv.shuttingDown() {
@@ -129,7 +131,11 @@ func (srv *Server) Serve(l net.Listener) error {
 		tempDelay = 0
 		c := srv.newConn(rw)
 		c.setState(c.rwc, http.StateNew, true /*runHooks ~=true */) // before Serve can return
-		go c.serve(connCtx)
+		if srv.maxConcurrentConnections() == 1 {
+			c.serve(connCtx)
+		} else {
+			go c.serve(connCtx)
+		}
 	}
 }
 
@@ -159,7 +165,9 @@ func (c *conn) serve(ctx context.Context) {
 			c.setState(c.rwc, http.StateClosed, true /*runHooks ~= true */)
 		}
 		// release the semaphore on the server for this connection.
-		<-c.server.connSem
+		if c.server.connSem != nil {
+			<-c.server.connSem
+		}
 	}()
 
 	if tlsConn, ok := c.rwc.(*tls.Conn); ok {
@@ -557,7 +565,7 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.connSem == nil {
+	if s.connSem == nil && s.maxConcurrentConnections() > 1 {
 		s.connSem = make(chan struct{}, s.maxConcurrentConnections())
 	}
 	if s.listeners == nil {
