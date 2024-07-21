@@ -58,7 +58,7 @@ func (srv *Server) Close() error {
 	return nil
 }
 
-func (srv *Server) Listen() error {
+func (srv *Server) ListenAndServe() error {
 	if srv.shuttingDown() {
 		return http.ErrServerClosed
 	}
@@ -74,14 +74,6 @@ func (srv *Server) Listen() error {
 }
 
 func (srv *Server) Serve(l net.Listener) error {
-	if srv.OnListen != nil {
-		srv.OnListen(l)
-	}
-
-	origListener := l
-	l = &onceCloseListener{Listener: l}
-	defer l.Close()
-
 	if !srv.trackListener(&l, true) {
 		return http.ErrServerClosed
 	}
@@ -89,13 +81,12 @@ func (srv *Server) Serve(l net.Listener) error {
 
 	baseCtx := context.Background()
 	if srv.BaseContext != nil {
-		baseCtx = srv.BaseContext(origListener)
+		baseCtx = srv.BaseContext(l)
 		if baseCtx == nil {
 			panic("BaseContext returned a nil context")
 		}
 	}
 
-	var tempDelay time.Duration // how long to sleep on accept failure
 	ctx := context.WithValue(baseCtx, http.ServerContextKey, srv)
 	for {
 		if srv.connSem != nil {
@@ -106,19 +97,6 @@ func (srv *Server) Serve(l net.Listener) error {
 			if srv.shuttingDown() {
 				return http.ErrServerClosed
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay *= 2
-				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
-				}
-				// srv.logf("http: Accept error: %v; retrying in %v", err, tempDelay)
-				time.Sleep(tempDelay)
-				continue
-			}
 			return err
 		}
 		connCtx := ctx
@@ -128,10 +106,9 @@ func (srv *Server) Serve(l net.Listener) error {
 				panic("ConnContext returned nil")
 			}
 		}
-		tempDelay = 0
 		c := srv.newConn(rw)
 		c.setState(c.rwc, http.StateNew, true /*runHooks ~=true */) // before Serve can return
-		if srv.maxConcurrentConnections() == 1 {
+		if srv.MaxConcurrentConnections == 1 {
 			c.serve(connCtx)
 		} else {
 			go c.serve(connCtx)
@@ -194,7 +171,7 @@ func (c *conn) serve(ctx context.Context) {
 		*c.tlsState = tlsConn.ConnectionState()
 		if proto := c.tlsState.NegotiatedProtocol; validNextProto(proto) {
 			if fn := c.server.TLSNextProto[proto]; fn != nil {
-				h := initALPNRequest{ctx, tlsConn, serverHandler{c.server}}
+				h := initALPNRequest{ctx, tlsConn, c.server.Handler}
 				// Mark freshly created HTTP/2 as active and prevent any server state hooks
 				// from being run on these connections. This prevents closeIdleConns from
 				// closing such connections. See issue https://golang.org/issue/39776.
@@ -214,7 +191,6 @@ func (c *conn) serve(ctx context.Context) {
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
-	resolvedHandler := serverHandler{c.server}
 	for {
 		w, err := c.readRequest(ctx)
 		if c.r.remain != c.server.initialReadLimitSize() {
@@ -290,7 +266,13 @@ func (c *conn) serve(ctx context.Context) {
 		// But we're not going to implement HTTP pipelining because it
 		// was never deployed in the wild and the answer is HTTP/2.
 		inFlightResponse = w
-		resolvedHandler.ServeHTTP(w, w.req)
+		if c.server.Handler == nil {
+			http.DefaultServeMux.ServeHTTP(w, req)
+		} else if !c.server.DisableGeneralOptionsHandler && req.RequestURI == "*" && req.Method == "OPTIONS" {
+			globalOptionsHandler{}.ServeHTTP(w, req)
+		} else {
+			c.server.Handler.ServeHTTP(w, req)
+		}
 		inFlightResponse = nil
 		w.cancelCtx()
 		if c.hijacked() {
@@ -300,8 +282,9 @@ func (c *conn) serve(ctx context.Context) {
 		c.rwc.SetWriteDeadline(time.Time{})
 
 		// call the out-of-band handler
-		resolvedHandler.OutOfBand(req)
-
+		if c.server.Handler != nil {
+			c.server.Handler.OutOfBand(req)
+		}
 		if !w.shouldReuseConnection() {
 			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
 				c.closeWriteAndWait()
@@ -359,7 +342,7 @@ func (w checkConnErrorWriter) Write(p []byte) (n int, err error) {
 type initALPNRequest struct {
 	ctx context.Context
 	c   *tls.Conn
-	h   serverHandler
+	h   Handler
 }
 
 // BaseContext is an exported but unadvertised [http.Handler] method
@@ -398,13 +381,6 @@ func (srv *Server) maxHeaderBytes() int {
 		return srv.MaxHeaderBytes
 	}
 	return DefaultMaxHeaderBytes
-}
-
-func (srv *Server) maxConcurrentConnections() int {
-	if srv.MaxConcurrentConnections > 0 {
-		return srv.MaxConcurrentConnections
-	}
-	return runtime.NumCPU()
 }
 
 func (srv *Server) initialReadLimitSize() int64 {
@@ -490,30 +466,6 @@ func validNextProto(proto string) bool {
 	return true
 }
 
-// serverHandler delegates to either the server's Handler or
-// DefaultServeMux and also handles "OPTIONS *" requests.
-type serverHandler struct {
-	srv *Server
-}
-
-func (sh serverHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	handler := sh.srv.Handler
-	if handler == nil {
-		handler = NoOutOfBandHandler{http.DefaultServeMux}
-	}
-	if !sh.srv.DisableGeneralOptionsHandler && req.RequestURI == "*" && req.Method == "OPTIONS" {
-		handler = NoOutOfBandHandler{globalOptionsHandler{}}
-	}
-	// we call user code ~here generally
-	handler.ServeHTTP(rw, req)
-}
-
-func (sh serverHandler) OutOfBand(req *http.Request) {
-	if sh.srv.Handler != nil {
-		sh.srv.Handler.OutOfBand(req)
-	}
-}
-
 // globalOptionsHandler responds to "OPTIONS *" requests.
 type globalOptionsHandler struct{}
 
@@ -565,8 +517,8 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.connSem == nil && s.maxConcurrentConnections() > 1 {
-		s.connSem = make(chan struct{}, s.maxConcurrentConnections())
+	if s.connSem == nil && s.MaxConcurrentConnections > 1 {
+		s.connSem = make(chan struct{}, s.MaxConcurrentConnections)
 	}
 	if s.listeners == nil {
 		s.listeners = make(map[*net.Listener]struct{})
@@ -577,6 +529,9 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 		}
 		s.listeners[ln] = struct{}{}
 		s.listenerGroup.Add(1)
+		if s.OnListen != nil {
+			s.OnListen(*ln)
+		}
 	} else {
 		delete(s.listeners, ln)
 		s.listenerGroup.Done()
@@ -596,21 +551,6 @@ func (s *Server) trackConn(c *conn, add bool) {
 		delete(s.activeConn, c)
 	}
 }
-
-// onceCloseListener wraps a net.Listener, protecting it from
-// multiple Close calls.
-type onceCloseListener struct {
-	net.Listener
-	once     sync.Once
-	closeErr error
-}
-
-func (oc *onceCloseListener) Close() error {
-	oc.once.Do(oc.close)
-	return oc.closeErr
-}
-
-func (oc *onceCloseListener) close() { oc.closeErr = oc.Listener.Close() }
 
 // A conn represents the server side of an HTTP connection.
 type conn struct {
