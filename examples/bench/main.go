@@ -14,7 +14,7 @@ import (
 	"github.com/wcharczuk/dyno"
 )
 
-var disableGC = flag.Bool("disable-gc", true, "disable automatic gc")
+var noGC = flag.Bool("no-gc", true, "disable automatic gc")
 var variant = flag.String("variant", "dyno", "the server variant to use (dyno|stdlib)")
 var addr = flag.String("addr", "127.0.0.1:8081", "the server listen addr")
 
@@ -23,7 +23,7 @@ var dynoMaxConns = flag.Int("dyno-max-conns", 32, "the dyno maximum current conn
 
 func main() {
 	flag.Parse()
-	if *disableGC {
+	if *noGC {
 		slog.Info("disabling automatic gc")
 		debug.SetGCPercent(-1)
 	}
@@ -71,7 +71,7 @@ const gcEvery = 1024 << 6
 
 func (h handler) OutOfBand(req *http.Request) {
 	if !*dynoDisableOOBGC {
-		if reqTotal.Add(1)%(gcEvery) == 0 {
+		if reqTotal.Add(1)%gcEvery == 0 {
 			slog.Info("running outofband compaction")
 			runtime.GC()
 		}
